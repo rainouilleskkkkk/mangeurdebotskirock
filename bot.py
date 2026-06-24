@@ -87,14 +87,19 @@ async def join_and_play():
             log.error("❌ Salon vocal introuvable.")
             return
 
-        if voice_client and voice_client.is_connected():
-            if voice_client.channel.id == CHANNEL_ID:
+        # Récupère la connexion existante si le bot est déjà dans un salon
+        existing = guild.voice_client
+        if existing:
+            if existing.channel.id == CHANNEL_ID:
+                voice_client = existing
+                log.info("✅ Réutilisation de la connexion existante.")
                 start_stream()
                 return
-            await voice_client.disconnect(force=True)
-            voice_client = None
-            await asyncio.sleep(2)
+            else:
+                await existing.disconnect(force=True)
+                await asyncio.sleep(2)
 
+        voice_client = None
         log.info(f"🔊 Connexion au salon : #{channel.name}")
         voice_client = await channel.connect()
         log.info("✅ Connecté !")
@@ -104,6 +109,7 @@ async def join_and_play():
         log.error(f"❌ Erreur connexion : {e}")
         voice_client = None
         await asyncio.sleep(10)
+        is_reconnecting = False
         await join_and_play()
 
     finally:
@@ -181,6 +187,9 @@ async def on_ready():
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.id != bot.user.id:
+        return
+    # Ignore si c'est le bot qui vient de se connecter
+    if not before.channel and after.channel:
         return
     if is_reconnecting:
         return
