@@ -1,8 +1,6 @@
 import asyncio
 import os
 import logging
-import subprocess
-from datetime import datetime
 
 import discord
 from discord.ext import tasks
@@ -27,11 +25,9 @@ intents.voice_states = True
 client = discord.Client(intents=intents)
 
 voice_client = None
-ffmpeg_process = None
 
 
 def get_ffmpeg_source():
-    """Crée une source audio FFmpeg pour le stream radio."""
     return discord.FFmpegPCMAudio(
         STREAM_URL,
         before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -39,38 +35,7 @@ def get_ffmpeg_source():
     )
 
 
-async def join_and_play():
-    """Rejoint le salon vocal et lance le stream."""
-    global voice_client
-
-    guild = client.get_guild(GUILD_ID)
-    if not guild:
-        log.error("❌ Serveur introuvable. Vérifie GUILD_ID.")
-        return
-
-    channel = guild.get_channel(CHANNEL_ID)
-    if not channel:
-        log.error("❌ Salon vocal introuvable. Vérifie CHANNEL_ID.")
-        return
-
-    log.info(f"🔊 Connexion au salon : #{channel.name}")
-
-    try:
-        if voice_client and voice_client.is_connected():
-            await voice_client.disconnect(force=True)
-
-        voice_client = await channel.connect()
-        log.info("✅ Connecté au salon vocal !")
-        start_stream()
-
-    except Exception as e:
-        log.error(f"❌ Erreur lors de la connexion : {e}")
-        await asyncio.sleep(10)
-        await join_and_play()
-
-
 def start_stream():
-    """Lance la diffusion du flux radio."""
     global voice_client
 
     if not voice_client or not voice_client.is_connected():
@@ -93,7 +58,6 @@ def start_stream():
 
 
 async def restart_stream():
-    """Redémarre le stream après une coupure."""
     await asyncio.sleep(3)
     if voice_client and voice_client.is_connected():
         start_stream()
@@ -102,9 +66,45 @@ async def restart_stream():
         await join_and_play()
 
 
+async def join_and_play():
+    global voice_client
+
+    guild = client.get_guild(GUILD_ID)
+    if not guild:
+        log.error("❌ Serveur introuvable. Vérifie GUILD_ID.")
+        return
+
+    channel = guild.get_channel(CHANNEL_ID)
+    if not channel:
+        log.error("❌ Salon vocal introuvable. Vérifie CHANNEL_ID.")
+        return
+
+    # Si déjà connecté au bon salon, relance juste le stream
+    if voice_client and voice_client.is_connected():
+        if voice_client.channel.id == CHANNEL_ID:
+            log.info("✅ Déjà connecté, relance du stream…")
+            start_stream()
+            return
+        else:
+            await voice_client.disconnect(force=True)
+            voice_client = None
+            await asyncio.sleep(1)
+
+    log.info(f"🔊 Connexion au salon : #{channel.name}")
+
+    try:
+        voice_client = await channel.connect()
+        log.info("✅ Connecté au salon vocal !")
+        start_stream()
+
+    except Exception as e:
+        log.error(f"❌ Erreur lors de la connexion : {e}")
+        await asyncio.sleep(10)
+        await join_and_play()
+
+
 @tasks.loop(minutes=1)
 async def watchdog():
-    """Vérifie toutes les minutes que le bot diffuse bien."""
     global voice_client
 
     if not voice_client or not voice_client.is_connected():
@@ -125,7 +125,6 @@ async def on_ready():
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    """Reconnecte si le bot est expulsé du salon."""
     if member.id != client.user.id:
         return
     if before.channel and before.channel.id == CHANNEL_ID and (not after.channel or after.channel.id != CHANNEL_ID):
@@ -133,5 +132,8 @@ async def on_voice_state_update(member, before, after):
         await asyncio.sleep(5)
         await join_and_play()
 
+
+# ─── Gestion des erreurs non capturées ───────────────────────
+process_on = asyncio.get_event_loop
 
 client.run(TOKEN)
