@@ -3,7 +3,7 @@ import os
 import logging
 
 import discord
-from discord.ext import tasks
+from discord.ext import tasks, commands
 
 # ─── Logging ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -13,18 +13,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Config via variables d'environnement ────────────────────
+# ─── Config ──────────────────────────────────────────────────
 TOKEN      = os.environ["DISCORD_TOKEN"]
 GUILD_ID   = int(os.environ["GUILD_ID"])
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 STREAM_URL = os.environ.get("STREAM_URL", "https://icecast.skyrock.net/s/natio_aac_128k")
+PREFIX     = "!"
 
 # ─── Bot ─────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.voice_states = True
-client = discord.Client(intents=intents)
+intents.message_content = True
+intents.messages = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 voice_client = None
+is_reconnecting = False
 
 
 def get_ffmpeg_source():
@@ -50,8 +55,7 @@ def start_stream():
     def after_play(error):
         if error:
             log.error(f"❌ Erreur stream : {error}")
-        log.info("🔄 Stream terminé. Redémarrage dans 3 s…")
-        asyncio.run_coroutine_threadsafe(restart_stream(), client.loop)
+        asyncio.run_coroutine_threadsafe(restart_stream(), bot.loop)
 
     voice_client.play(source, after=after_play)
     log.info("▶️  Radio en cours de diffusion !")
@@ -62,78 +66,129 @@ async def restart_stream():
     if voice_client and voice_client.is_connected():
         start_stream()
     else:
-        log.info("🔄 Reconnexion au salon vocal…")
         await join_and_play()
 
 
 async def join_and_play():
-    global voice_client
+    global voice_client, is_reconnecting
 
-    guild = client.get_guild(GUILD_ID)
-    if not guild:
-        log.error("❌ Serveur introuvable. Vérifie GUILD_ID.")
+    if is_reconnecting:
         return
-
-    channel = guild.get_channel(CHANNEL_ID)
-    if not channel:
-        log.error("❌ Salon vocal introuvable. Vérifie CHANNEL_ID.")
-        return
-
-    # Si déjà connecté au bon salon, relance juste le stream
-    if voice_client and voice_client.is_connected():
-        if voice_client.channel.id == CHANNEL_ID:
-            log.info("✅ Déjà connecté, relance du stream…")
-            start_stream()
-            return
-        else:
-            await voice_client.disconnect(force=True)
-            voice_client = None
-            await asyncio.sleep(1)
-
-    log.info(f"🔊 Connexion au salon : #{channel.name}")
+    is_reconnecting = True
 
     try:
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            log.error("❌ Serveur introuvable.")
+            return
+
+        channel = guild.get_channel(CHANNEL_ID)
+        if not channel:
+            log.error("❌ Salon vocal introuvable.")
+            return
+
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel.id == CHANNEL_ID:
+                start_stream()
+                return
+            await voice_client.disconnect(force=True)
+            voice_client = None
+            await asyncio.sleep(2)
+
+        log.info(f"🔊 Connexion au salon : #{channel.name}")
         voice_client = await channel.connect()
-        log.info("✅ Connecté au salon vocal !")
+        log.info("✅ Connecté !")
         start_stream()
 
     except Exception as e:
-        log.error(f"❌ Erreur lors de la connexion : {e}")
+        log.error(f"❌ Erreur connexion : {e}")
+        voice_client = None
         await asyncio.sleep(10)
         await join_and_play()
 
+    finally:
+        is_reconnecting = False
 
-@tasks.loop(minutes=1)
-async def watchdog():
+
+# ─── Commandes ───────────────────────────────────────────────
+@bot.command(name="join", aliases=["radio", "play", "start"])
+async def cmd_join(ctx):
+    await ctx.message.add_reaction("📻")
+    await join_and_play()
+    await ctx.send("📻 Skyrock est en cours de diffusion !")
+
+
+@bot.command(name="leave", aliases=["stop", "dc", "quit"])
+async def cmd_leave(ctx):
     global voice_client
 
+    if voice_client and voice_client.is_connected():
+        watchdog.stop()
+        if voice_client.is_playing():
+            voice_client.stop()
+        await voice_client.disconnect()
+        voice_client = None
+        await ctx.message.add_reaction("👋")
+        await ctx.send("👋 Déconnecté du salon vocal.")
+    else:
+        await ctx.send("❌ Je ne suis dans aucun salon vocal.")
+
+
+@bot.command(name="help", aliases=["aide", "h"])
+async def cmd_help(ctx):
+    embed = discord.Embed(
+        title="📻 Skyrock Radio Bot",
+        description="Bot qui diffuse Skyrock en salon vocal 24h/24",
+        color=0xFF4500
+    )
+    embed.add_field(
+        name="🎵 Musique",
+        value=(
+            "`!join` / `!radio` / `!play` / `!start`\n→ Rejoint le salon et lance Skyrock\n\n"
+            "`!leave` / `!stop` / `!dc` / `!quit`\n→ Quitte le salon vocal"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="❓ Aide",
+        value="`!help` / `!aide`\n→ Affiche ce message",
+        inline=False
+    )
+    embed.set_footer(text="🎶 Skyrock • 96.0 FM")
+    await ctx.send(embed=embed)
+
+
+# ─── Watchdog ────────────────────────────────────────────────
+@tasks.loop(minutes=2)
+async def watchdog():
+    if is_reconnecting:
+        return
     if not voice_client or not voice_client.is_connected():
-        log.warning("🐕 Watchdog : bot déconnecté, reconnexion…")
+        log.warning("🐕 Watchdog : déconnecté, reconnexion…")
         await join_and_play()
     elif not voice_client.is_playing():
         log.warning("🐕 Watchdog : stream arrêté, redémarrage…")
         start_stream()
 
 
-@client.event
+@bot.event
 async def on_ready():
-    log.info(f"🤖 Bot connecté en tant que {client.user}")
-    log.info(f"📻 Stream URL : {STREAM_URL}")
-    await join_and_play()
-    watchdog.start()
+    log.info(f"🤖 Bot connecté : {bot.user}")
+    log.info(f"📻 Stream : {STREAM_URL}")
+    log.info("💬 Commandes : !join | !leave | !help")
 
 
-@client.event
+@bot.event
 async def on_voice_state_update(member, before, after):
-    if member.id != client.user.id:
+    if member.id != bot.user.id:
         return
-    if before.channel and before.channel.id == CHANNEL_ID and (not after.channel or after.channel.id != CHANNEL_ID):
-        log.info("👢 Bot expulsé du salon. Reconnexion dans 5 s…")
-        await asyncio.sleep(5)
-        await join_and_play()
+    if is_reconnecting:
+        return
+    if before.channel and before.channel.id == CHANNEL_ID:
+        if not after.channel or after.channel.id != CHANNEL_ID:
+            log.info("👢 Bot expulsé. Reconnexion dans 5 s…")
+            await asyncio.sleep(5)
+            await join_and_play()
 
 
-# ─── Gestion des erreurs non capturées ───────────────────────
-process_on = asyncio.get_event_loop
-
-client.run(TOKEN)
+bot.run(TOKEN)
